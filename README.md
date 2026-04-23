@@ -1,7 +1,7 @@
 # StudyMate
 
 Personal AI study assistant — CLI chatbot with memory, tools, RAG, and MCP server.
-    
+
 ## Setup
 
 ```bash
