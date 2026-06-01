@@ -1,0 +1,49 @@
+{
+  "created_at": "2024-11-15T09:12:04Z",
+  "saved_at": "2024-11-15T09:28:37Z",
+  "history": [
+    {
+      "role": "user",
+      "content": "Can you explain gradient descent to me? I keep confusing myself about why subtracting the gradient actually moves us toward the minimum."
+    },
+    {
+      "role": "assistant",
+      "content": "**Reasoning:**\nThe student is confused about the sign convention — why we subtract the gradient rather than add it. I should build intuition geometrically before giving the algebra.\n\n**Answer:**\nGreat question — the sign is the part that trips most people up.\n\nThe gradient ∇L(θ) points in the direction of *steepest ascent* of the loss surface. Think of it as an arrow on a hillside pointing uphill. If you want to go *downhill* (minimize loss), you need to walk in the *opposite* direction — hence the minus sign.\n\nThe update rule is:\n\n```\nθ ← θ − α · ∇L(θ)\n```\n\nHere α (the learning rate) controls the step size. A tiny α means cautious baby steps; a huge α risks overshooting the valley and bouncing around or even diverging.\n\nGeometrically: imagine standing on a loss landscape. The gradient tells you which way is \"up\". You take one step in the direction it *doesn't* point, land somewhere with (hopefully) lower loss, recompute the gradient from that new position, and repeat. Over many steps you descend toward a local minimum."
+    },
+    {
+      "role": "user",
+      "content": "What is 2 to the power of 10? Use the calculator tool."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Sure, let me compute that for you."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_01XkQpBmN3R8sV7wYzLcFdHj",
+          "name": "calculator",
+          "input": {
+            "expression": "2 ** 10"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01XkQpBmN3R8sV7wYzLcFdHj",
+          "content": "1024"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "2¹⁰ = **1024**. This is also why computer scientists love powers of two — 1 KB is 2¹⁰ bytes, 1 MB is 2²⁰, and so on. Each doubling adds one bit of address space."
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+Lecture 4 — Gradient Descent
+CS 4812 · Machine Learning Foundations
+Instructor: Prof. A. Reyes  |  Week 4, Tuesday
+
+===============================================================
+
+Last time we derived the cost function J(θ) for linear regression
+and showed that minimizing it is equivalent to finding the parameter
+vector θ that best fits our training data in a least-squares sense.
+Today we figure out *how* to actually find that minimum efficiently.
+
+---------------------------------------------------------------
+1. THE CORE IDEA
+---------------------------------------------------------------
+
+We can't always solve ∇J(θ) = 0 analytically — the normal equations
+only work for linear models, and even then they require inverting an
+(n×n) matrix which is O(n³). For neural nets this is completely out
+of the question.
+
+Instead we use an iterative approach: start somewhere, look around,
+take a small step downhill, repeat.
+
+The gradient ∇J(θ) tells us the direction of steepest *ascent* of the
+loss surface. To descend, we move in the opposite direction:
+
+    θ  ←  θ  −  α · ∇J(θ)
+
+Where:
+  θ     — current parameter vector
+  α     — learning rate (a positive scalar we choose)
+  ∇J(θ) — gradient of the loss with respect to θ
+
+This is the entire algorithm. Everything else is engineering around it.
+
+---------------------------------------------------------------
+2. WHY DOES SUBTRACTING THE GRADIENT WORK?
+---------------------------------------------------------------
+
+Imagine you're blindfolded on a hilly landscape and want to reach
+the lowest valley. You can only feel the slope under your feet.
+
+The gradient is a vector pointing uphill. Walk in the direction it
+*doesn't* point and you go downhill. After each step the terrain
+changes, so you recompute, reorient, and step again.
+
+More formally: by a first-order Taylor expansion,
+
+    J(θ − α·∇J) ≈ J(θ) − α · ||∇J||²
+
+Since α and ||∇J||² are both non-negative, the right side is less
+than J(θ) — we're guaranteed to decrease the loss, at least locally,
+provided α is small enough.
+
+---------------------------------------------------------------
+3. THREE VARIANTS
+---------------------------------------------------------------
+
+The difference between variants comes down to *which* data we use
+when computing the gradient each step.
+
+3a. Batch Gradient Descent
+  - Compute ∇J over the entire training set before each update.
+  - Pro: stable, smooth convergence; gradient is exact.
+  - Con: one pass through N examples per step → catastrophically
+    slow for large datasets (ImageNet-scale = unusable).
+  - When to use: tiny datasets, or when you need a clean baseline.
+
+3b. Stochastic Gradient Descent (SGD)
+  - Pick ONE random example, compute its gradient, update θ.
+  - Pro: very fast per update; noise can escape shallow local minima.
+  - Con: very noisy — loss curve is jagged; hard to diagnose.
+    Requires a carefully decayed learning rate to converge.
+  - When to use: online learning, extremely large datasets, RL.
+
+3c. Mini-Batch Gradient Descent
+  - Pick a batch of k examples (typically k = 32, 64, or 128),
+    compute the average gradient over the batch, update θ.
+  - Pro: best of both worlds — smoother than SGD, GPU-parallelizable,
+    doesn't require loading the full dataset.
+  - Con: introduces a new hyperparameter (batch size); gradient is
+    still an approximation, though a much better one than SGD.
+  - When to use: almost always — this is the default in practice.
+
+In modern deep learning "SGD" almost always means mini-batch SGD.
+The naming is historical and unfortunately confusing.
+
+---------------------------------------------------------------
+4. LEARNING RATE: THE MOST IMPORTANT HYPERPARAMETER
+---------------------------------------------------------------
+
+Too large α → steps overshoot the minimum, loss oscillates or diverges.
+Too small α → convergence takes forever; you may get stuck near a
+              saddle point before the gradient is small enough to move.
+
+Common schedules:
+  - Step decay:      halve α every k epochs
+  - Exponential:     α_t = α_0 · e^(−λt)
+  - Cosine annealing: smoothly cycles α between a max and near-zero
+  - Warmup + decay:  start small, ramp up, then decay — standard in
+                     large Transformer training runs
+
+Rule of thumb for a starting value: try 1e-3 with Adam, 1e-1 with
+plain SGD. Always plot the loss curve; if it spikes, α is too big.
+
+---------------------------------------------------------------
+5. COMMON PITFALLS
+---------------------------------------------------------------
+
+Vanishing Gradients
+  In deep networks, gradients are multiplied layer by layer during
+  backprop. If weights are small, each multiplication shrinks the
+  signal. By the time you reach early layers the gradient is ≈ 0 and
+  those layers stop learning entirely. Classic problem with sigmoid
+  activations. Fix: use ReLU, batch norm, or residual connections.
+
+Exploding Gradients
+  The mirror image: gradients grow exponentially, weights blow up,
+  loss becomes NaN. Fix: gradient clipping (cap ||∇|| at some max).
+
+Saddle Points
+  In high-dimensional spaces true local minima are rare. More common
+  are saddle points — the surface curves up in some directions, down
+  in others. Plain gradient descent can slow dramatically near them.
+  Momentum-based optimizers (Adam, RMSProp) handle this much better.
+
+Plateaus
+  Regions where the gradient is very small but we're not at a minimum.
+  Batch norm and good initialization help escape these.
+
+---------------------------------------------------------------
+6. BEYOND VANILLA GRADIENT DESCENT
+---------------------------------------------------------------
+
+We'll cover this in Lecture 7, but briefly:
+  - Momentum: accumulate a velocity term to smooth updates
+  - RMSProp: adapt the learning rate per parameter based on
+             recent gradient magnitudes
+  - Adam:    momentum + RMSProp together; the practical default
+
+---------------------------------------------------------------
+KEY TAKEAWAYS
+---------------------------------------------------------------
+
+1. θ ← θ − α·∇J(θ) is the fundamental update rule.
+2. The minus sign comes from wanting to descend, not ascend.
+3. Mini-batch SGD is the default; batch and stochastic are edge cases.
+4. Learning rate is the most sensitive hyperparameter — always tune it.
+5. Vanishing gradients and saddle points are the main failure modes
+   in deep networks; architecture choices (ReLU, residuals) mitigate them.
+
+Next lecture: backpropagation — how we compute ∇J efficiently.
+
+===============================================================
+Reading: Goodfellow et al., Deep Learning, Ch. 8.1–8.3
+Exercise: implement mini-batch gradient descent on the MNIST logistic
+regression from last week's lab and plot loss vs. epoch for three
+different learning rates.
