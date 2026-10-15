@@ -4,16 +4,14 @@ RAG (Retrieval-Augmented Generation) pipeline for StudyMate.
 Design decisions:
 
   Local embeddings (sentence-transformers):
-    We use a locally-run model instead of an embedding API so the pipeline
-    works offline, costs nothing per query, and keeps student notes private.
-    all-MiniLM-L6-v2 is ~22 MB, fast on CPU, and accurate enough for
-    lecture-note retrieval.
+    Embedding runs locally after the first model download. Retrieved passages
+    are still sent to the configured answer provider; local indexing does not
+    make the complete assistant private or offline.
 
   Numpy over FAISS/ChromaDB:
     A student's notes folder rarely exceeds a few thousand chunks.  At that
     scale, a brute-force dot-product scan over a float32 numpy matrix is
-    measured in milliseconds and adds zero external dependencies.  FAISS pays
-    off at millions of vectors; we'd be importing complexity for no gain.
+    handled by a NumPy dot-product scan rather than a separate vector database.
 
   L2-normalised vectors + dot product = cosine similarity:
     When every vector has unit length, dot(a, b) == cosine_similarity(a, b).
@@ -22,10 +20,10 @@ Design decisions:
     in a plain float32 array with no extra bookkeeping.
 
   Disk cache (manifest hash):
-    Embedding is the slow step (~10 s cold on CPU).  We hash each file's
+    We hash each file's
     path, size, and mtime to detect any change in the notes folder.  If the
     hash and model name both match the cached index, we skip embedding and
-    load the pre-computed vectors from disk in ~0.2 s.
+    load the pre-computed vectors from disk.
 """
 
 from __future__ import annotations
@@ -45,6 +43,7 @@ import numpy as np
 _EMBED_MODEL   = "sentence-transformers/all-MiniLM-L6-v2"
 _CHUNK_CHARS   = 1600   # ~400 tokens at ~4 chars/token
 _CHUNK_OVERLAP = 200    # ~50 token overlap so context isn't lost at boundaries
+_CACHE_VERSION = 2     # invalidate indexes built with the repeated-tail chunk bug
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -52,7 +51,7 @@ _CHUNK_OVERLAP = 200    # ~50 token overlap so context isn't lost at boundaries
 
 @dataclass
 class Chunk:
-    source:   str   # filename stem (for readable citations)
+    source:   str   # document path without suffix (for readable citations)
     chunk_id: int
     text:     str
 
@@ -105,11 +104,13 @@ def _collect_files(path: Path) -> list[Path]:
     If *path* is a single file, return it directly.  Otherwise walk the
     directory tree and collect .txt, .md, and .pdf files.
     """
+    supported = {".txt", ".md", ".pdf"}
     if path.is_file():
-        return [path]
+        return [path] if path.suffix.lower() in supported else []
     files: list[Path] = []
-    for pattern in ("*.txt", "*.md", "*.pdf"):
-        files.extend(sorted(path.rglob(pattern)))
+    for candidate in sorted(path.rglob("*")):
+        if candidate.is_file() and candidate.suffix.lower() in supported:
+            files.append(candidate)
     return files
 
 
@@ -168,6 +169,9 @@ def chunk_text(text: str, source: str) -> list[Chunk]:
             chunks.append(Chunk(source=source, chunk_id=chunk_id, text=content))
             chunk_id += 1
 
+        if end == n:
+            break
+
         # Slide forward, backing up by _CHUNK_OVERLAP so adjacent chunks
         # share context across their boundary.
         start = max(start + 1, end - _CHUNK_OVERLAP)
@@ -211,6 +215,30 @@ def _embed(model: Any, texts: list[str]) -> np.ndarray:
 # Index building
 # ---------------------------------------------------------------------------
 
+def load_cached_index(cache_dir: Path) -> RagIndex:
+    """Load a complete cache or raise ValueError/OSError for invalid state."""
+    meta = json.loads((cache_dir / "meta.json").read_text(encoding="utf-8"))
+    if not isinstance(meta, dict) or not isinstance(meta.get("chunks"), list):
+        raise ValueError("Invalid notes index metadata.")
+    if meta.get("version") != _CACHE_VERSION:
+        raise ValueError("Notes index needs rebuilding with the current chunker.")
+    if not isinstance(meta.get("model_name"), str) or not isinstance(meta.get("manifest_hash"), str):
+        raise ValueError("Invalid notes index model or manifest.")
+    chunks = []
+    for item in meta["chunks"]:
+        if not isinstance(item, dict) or not isinstance(item.get("source"), str):
+            raise ValueError("Invalid notes index chunk.")
+        if type(item.get("chunk_id")) is not int or not isinstance(item.get("text"), str):
+            raise ValueError("Invalid notes index chunk.")
+        chunks.append(Chunk(source=item["source"], chunk_id=item["chunk_id"], text=item["text"]))
+    vectors = np.load(str(cache_dir / "vectors.npy"), allow_pickle=False)
+    if vectors.ndim != 2 or vectors.shape[0] != len(chunks) or vectors.shape[1] == 0:
+        raise ValueError("Notes index vectors do not match its chunks.")
+    if not np.issubdtype(vectors.dtype, np.number) or not np.isfinite(vectors).all():
+        raise ValueError("Invalid notes index vectors.")
+    return RagIndex(chunks, vectors, meta["model_name"], meta["manifest_hash"])
+
+
 def build_index(
     docs_path: Path,
     cache_dir: Path = Path("rag_index"),
@@ -236,25 +264,15 @@ def build_index(
     # --- Cache hit -----------------------------------------------------------
     if meta_path.exists() and vecs_path.exists():
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            cached = load_cached_index(cache_dir)
             if (
-                meta.get("manifest_hash") == current_hash
-                and meta.get("model_name") == model_name
+                cached.manifest_hash == current_hash
+                and cached.model_name == model_name
             ):
                 if verbose:
                     print("[RAG] Cache hit — loading index from disk.")
-                chunks = [
-                    Chunk(source=c["source"], chunk_id=c["chunk_id"], text=c["text"])
-                    for c in meta["chunks"]
-                ]
-                embeddings = np.load(str(vecs_path))
-                return RagIndex(
-                    chunks=chunks,
-                    embeddings=embeddings,
-                    model_name=model_name,
-                    manifest_hash=current_hash,
-                )
-        except (json.JSONDecodeError, KeyError, OSError):
+                return cached
+        except (ValueError, OSError, EOFError):
             # Corrupt cache — fall through and rebuild.
             pass
 
@@ -272,7 +290,8 @@ def build_index(
             if verbose:
                 print(f"  Warning: could not read {f.name}: {exc}")
             continue
-        all_chunks.extend(chunk_text(text, source=f.stem))
+        source_path = f.relative_to(docs_path) if docs_path.is_dir() else Path(f.name)
+        all_chunks.extend(chunk_text(text, source=source_path.with_suffix("").as_posix()))
 
     if not all_chunks:
         if verbose:
@@ -289,6 +308,7 @@ def build_index(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     meta_out = {
+        "version": _CACHE_VERSION,
         "manifest_hash": current_hash,
         "model_name":    model_name,
         "chunks": [
@@ -368,6 +388,8 @@ RETRIEVE_TOOL_SCHEMA: dict = {
                 },
                 "top_k": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
                     "description": "Number of passages to retrieve (1–8, default 4).",
                     "default": 4,
                 },
@@ -380,12 +402,20 @@ RETRIEVE_TOOL_SCHEMA: dict = {
 
 def run_retrieve_tool(index: RagIndex, arguments: dict) -> str:
     """Execute a retrieve_from_notes tool call and return formatted context."""
-    query = arguments.get("query", "").strip()
-    if not query:
-        return "Error: 'query' argument is required."
+    if not isinstance(arguments, dict):
+        return "Error: tool arguments must be a JSON object."
+    query = arguments.get("query", "")
+    if not isinstance(query, str) or not query.strip():
+        return "Error: 'query' must be a non-empty string."
+    top_k = arguments.get("top_k", 4)
+    if type(top_k) is not int:
+        return "Error: 'top_k' must be an integer."
 
-    top_k = max(1, min(int(arguments.get("top_k", 4)), 8))
-    hits  = retrieve(index, query, top_k=top_k)
+    top_k = max(1, min(top_k, 8))
+    try:
+        hits = retrieve(index, query.strip(), top_k=top_k)
+    except Exception as exc:
+        return f"Error: could not retrieve notes: {exc}"
 
     if not hits:
         return "No relevant passages found in the student's notes for this query."

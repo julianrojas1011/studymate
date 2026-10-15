@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +43,31 @@ def _serialise(msg: dict) -> dict:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _valid_message(message: object) -> bool:
+    """Validate the persisted OpenAI-style shape before reusing it in requests."""
+    if not isinstance(message, dict) or message.get("role") not in {"user", "assistant", "tool"}:
+        return False
+    if not isinstance(message.get("content"), str):
+        if message.get("role") != "assistant" or message.get("content") is not None:
+            return False
+        if not message.get("tool_calls"):
+            return False
+    if message["role"] == "tool" and not isinstance(message.get("tool_call_id"), str):
+        return False
+    calls = message.get("tool_calls", [])
+    if not isinstance(calls, list):
+        return False
+    for call in calls:
+        if not isinstance(call, dict) or not isinstance(call.get("id"), str):
+            return False
+        function = call.get("function")
+        if not isinstance(function, dict):
+            return False
+        if not all(isinstance(function.get(key), str) for key in ("name", "arguments")):
+            return False
+    return True
 
 
 def _extract_text(content: object) -> str:
@@ -134,23 +161,32 @@ class Memory:
         Failures are handled gracefully so a missing or corrupt file never
         crashes the REPL at startup — the session simply starts fresh.
         """
+        self._history = []
+        self.created_at = _now_iso()
         try:
             text = self.path.read_text(encoding="utf-8")
             data = json.loads(text)
-            self._history = data.get("history", [])
-            self.created_at = data.get("created_at", _now_iso())
+            if not isinstance(data, dict):
+                raise ValueError("memory must contain a JSON object")
+            history = data.get("history", [])
+            if not isinstance(history, list) or not all(_valid_message(m) for m in history):
+                raise ValueError("memory contains invalid messages")
+            created_at = data.get("created_at", self.created_at)
+            if not isinstance(created_at, str):
+                raise ValueError("created_at must be a string")
+            self._history = [_serialise(message) for message in history]
+            self.created_at = created_at
         except FileNotFoundError:
             # First run — perfectly normal.
             pass
-        except (json.JSONDecodeError, KeyError, TypeError):
-            # Corrupt file.  Start fresh rather than crashing.
-            self._history = []
-            self.created_at = _now_iso()
+        except (ValueError, OSError) as exc:
+            warnings.warn(f"Could not load memory; starting a fresh session: {exc}", stacklevel=2)
 
     def save(self) -> None:
         """Persist history to disk using an atomic write.
 
-        We write to <path>.tmp first, then call os.replace() to swap it
+        We write to a unique temporary file alongside the destination, then
+        call os.replace() to swap it
         into place.  os.replace() is atomic on POSIX (rename syscall) and
         transactional on Windows, so the real file is never in a partial
         state even if the process is killed during the write.
@@ -160,9 +196,19 @@ class Memory:
             "saved_at": _now_iso(),
             "history": self._history,
         }
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp_path, self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, self.path)
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     def clear(self) -> None:
         """Wipe in-memory history, reset the creation timestamp, and delete the file."""

@@ -131,11 +131,17 @@ def _to_anthropic_messages(
                 content_blocks.append({"type": "text", "text": text or " "})
 
             for tc in tool_calls:
+                try:
+                    tool_input = json.loads(tc["function"]["arguments"])
+                except (json.JSONDecodeError, TypeError):
+                    tool_input = {}
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
                 content_blocks.append({
                     "type": "tool_use",
                     "id": tc["id"],
                     "name": tc["function"]["name"],
-                    "input": json.loads(tc["function"]["arguments"]),
+                    "input": tool_input,
                 })
 
             converted.append({"role": "assistant", "content": content_blocks})
@@ -193,6 +199,7 @@ def _to_anthropic_tools(tools: list[dict]) -> list[dict]:
 _DEFAULTS = {
     "anthropic": "claude-opus-4-7",
     "groq": "llama-3.3-70b-versatile",
+    "openai": "gpt-4o",
 }
 
 _GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -220,6 +227,9 @@ class LLMClient:
         self.provider = (
             cfg.get("provider") or os.getenv("STUDYMATE_PROVIDER") or "anthropic"
         ).lower()
+
+        if self.provider not in _DEFAULTS:
+            raise LLMError("STUDYMATE_PROVIDER must be anthropic, groq, or openai.")
 
         default_model = _DEFAULTS.get(self.provider, _DEFAULTS["anthropic"])
         self.model = cfg.get("model") or os.getenv("STUDYMATE_MODEL") or default_model
@@ -284,21 +294,19 @@ class LLMClient:
             kwargs["tools"] = _to_anthropic_tools(tools)
 
         # Temperature is intentionally omitted.
-        # Anthropic Opus 4.7 returns HTTP 400 when temperature is included —
-        # extended-thinking models reject sampling params that would interfere
-        # with their internal reasoning process.
+        # Leave sampling to provider defaults; some models reject this parameter.
 
         try:
             response = self._anthropic.messages.create(**kwargs)
         except anthropic.APIError as exc:
             raise _translate_anthropic_error(exc) from exc
 
-        text_content: str | None = None
+        text_blocks: list[str] = []
         tool_calls: list[_ToolCallShim] = []
 
         for block in response.content:
             if block.type == "text":
-                text_content = block.text
+                text_blocks.append(block.text)
             elif block.type == "tool_use":
                 tool_calls.append(
                     _ToolCallShim(
@@ -311,7 +319,7 @@ class LLMClient:
                 )
 
         return _MessageShim(
-            content=text_content,
+            content="\n".join(text_blocks) or None,
             tool_calls=tool_calls or None,
         )
 

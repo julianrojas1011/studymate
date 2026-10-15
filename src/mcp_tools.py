@@ -2,10 +2,9 @@
 MCP-facing tool implementations for StudyMate.
 
 This module is a thin adapter layer: it reuses the exact same LLMClient,
-Memory, and RAG code that the CLI REPL uses.  The MCP server and the
-terminal therefore produce identical answers given identical inputs.
+Memory, and RAG code that the CLI REPL uses. Model answers may vary.
 
-Lazy singletons (_client, _rag) are initialised on first use so importing
+The client is initialised on first use so importing
 this module does not trigger network calls, model downloads, or file I/O.
 
 MCP callers are stateless — ask_studymate does NOT persist memory between
@@ -17,6 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 import numpy as np
@@ -28,10 +28,13 @@ from .rag import (
     RagIndex,
     Chunk,
     _EMBED_MODEL,
+    _CACHE_VERSION,
     _get_model,
     _embed,
     run_retrieve_tool,
     RETRIEVE_TOOL_SCHEMA,
+    build_index,
+    load_cached_index,
 )
 from .tools import TOOL_SCHEMAS, run_tool
 
@@ -46,8 +49,7 @@ _MAX_TOOL_ROUNDS = 6  # hard ceiling on the agentic loop to prevent runaway cost
 # ---------------------------------------------------------------------------
 
 _client: LLMClient | None = None
-_rag: RagIndex | None = None
-_rag_path: Path | None = None   # tracks which docs path the current _rag was built from
+_index_lock = RLock()
 
 
 def _get_client() -> LLMClient:
@@ -58,36 +60,25 @@ def _get_client() -> LLMClient:
     return _client
 
 
-def _get_rag(docs: str) -> RagIndex | None:
-    """Return a RagIndex for *docs*, reusing the cached singleton when possible.
-
-    Returns None if *docs* is falsy or points to a non-existent path so
-    callers can degrade gracefully to non-RAG answers.
-    """
-    global _rag, _rag_path
-
-    if not docs:
-        return None
-
-    docs_path = Path(docs)
-    if not docs_path.exists():
-        return None
-
-    # Rebuild only when the docs path has changed; build_index itself handles
-    # hash-based cache invalidation when files inside the folder change.
-    if _rag is None or _rag_path != docs_path:
-        from .rag import build_index
-        _rag      = build_index(docs_path, verbose=False)
-        _rag_path = docs_path
-
-    return _rag
+def _get_rag(docs: str | None, cache_dir: str = "rag_index") -> RagIndex | None:
+    """Refresh changed documents, or load notes previously added through MCP."""
+    cache = Path(cache_dir)
+    with _index_lock:
+        if docs:
+            docs_path = Path(docs)
+            if not docs_path.exists():
+                raise ValueError(f"Notes path does not exist: {docs}")
+            return build_index(docs_path, cache_dir=cache, verbose=False)
+        if (cache / "meta.json").exists() or (cache / "vectors.npy").exists():
+            return load_cached_index(cache)
+    return None
 
 
 # ---------------------------------------------------------------------------
 # ask_studymate
 # ---------------------------------------------------------------------------
 
-def ask_studymate(question: str, docs: str | None = None) -> str:
+def ask_studymate(question: str, docs: str | None = None, cache_dir: str = "rag_index") -> str:
     """Answer a study question with full tool-use support.
 
     Builds a minimal one-shot conversation (system prompt + few-shot examples
@@ -98,21 +89,25 @@ def ask_studymate(question: str, docs: str | None = None) -> str:
         question: The student's question.
         docs:     Optional path to a notes folder or file.  When provided,
                   the retrieve_from_notes tool is made available.
+        cache_dir: Index directory, including passages added through MCP.
 
     Returns:
         The assistant's answer as a plain string, or an error message if
         the API call fails.
     """
+    if not isinstance(question, str) or not question.strip():
+        return "Error: question must be a non-empty string."
     question = question.strip()
-    if not question:
-        return "Error: question must not be empty."
 
     try:
         client = _get_client()
     except LLMError as exc:
         return f"Configuration error: {exc}"
 
-    rag_index = _get_rag(docs) if docs else None
+    try:
+        rag_index = _get_rag(docs, cache_dir)
+    except Exception as exc:
+        return f"Error: could not load notes: {exc}"
 
     # Build the active tool list for this call.
     active_tools = list(TOOL_SCHEMAS)
@@ -160,7 +155,7 @@ def ask_studymate(question: str, docs: str | None = None) -> str:
             name = tc.function.name
             try:
                 args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 args = {}
 
             if name == "retrieve_from_notes" and rag_index is not None:
@@ -175,13 +170,7 @@ def ask_studymate(question: str, docs: str | None = None) -> str:
                 "content":      result,
             })
 
-    # If we exhaust _MAX_TOOL_ROUNDS without a clean finish, return whatever
-    # the model last produced rather than silently returning nothing.
-    last = messages[-1]
-    return (
-        last.get("content")
-        or "Error: tool loop exceeded maximum rounds without producing an answer."
-    )
+    return "Error: tool loop exceeded maximum rounds without producing an answer."
 
 
 # ---------------------------------------------------------------------------
@@ -193,15 +182,20 @@ def add_to_knowledge_base(
     source: str,
     cache_dir: str = "rag_index",
 ) -> str:
+    """Append a passage without mixing indexes or losing concurrent MCP writes."""
+    with _index_lock:
+        return _add_to_knowledge_base(text, source, cache_dir)
+
+
+def _add_to_knowledge_base(text: str, source: str, cache_dir: str) -> str:
     """Add a text passage to the RAG index without re-embedding everything.
 
-    Loads the existing index state (from the in-memory singleton, or from
-    the disk cache, or starts empty), creates a single new Chunk, embeds it,
-    and stacks it onto the existing embeddings matrix.  Saves the updated
-    index to disk and refreshes the singleton.
+    Loads the selected disk cache, creates a chunk, embeds it, and saves the
+    updated index. Invalid existing caches return an error instead of silently
+    discarding notes.
 
-    This is an incremental O(1) embedding call — we never re-embed the
-    existing corpus.
+    Only the new passage is embedded. The existing corpus is copied when the
+    updated matrix is saved.
 
     Args:
         text:      The passage to add.
@@ -211,15 +205,12 @@ def add_to_knowledge_base(
     Returns:
         A confirmation string such as "added chunk lecture_4#3 (total 42 chunks)".
     """
-    text   = text.strip()
+    if not isinstance(text, str) or not text.strip():
+        return "Error: text must be a non-empty string."
+    if not isinstance(source, str) or not source.strip():
+        return "Error: source must be a non-empty string."
+    text = text.strip()
     source = source.strip()
-
-    if not text:
-        return "Error: text must not be empty."
-    if not source:
-        return "Error: source must not be empty."
-
-    global _rag
 
     cache_path = Path(cache_dir)
     meta_path  = cache_path / "meta.json"
@@ -231,31 +222,22 @@ def add_to_knowledge_base(
     manifest_hash = ""
     model_name    = _EMBED_MODEL
 
-    if _rag is not None:
-        # Fast path: singleton already loaded in memory.
+    if meta_path.exists() or vecs_path.exists():
+        try:
+            cached = load_cached_index(cache_path)
+        except (ValueError, OSError, EOFError) as exc:
+            return f"Error: could not load existing notes index: {exc}"
         existing_chunks = [
             {"source": c.source, "chunk_id": c.chunk_id, "text": c.text}
-            for c in _rag.chunks
+            for c in cached.chunks
         ]
-        existing_vecs = _rag.embeddings
-        manifest_hash = _rag.manifest_hash
-        model_name    = _rag.model_name
-    elif meta_path.exists() and vecs_path.exists():
-        # Warm path: singleton is cold but cache is on disk.
-        try:
-            meta            = json.loads(meta_path.read_text(encoding="utf-8"))
-            existing_chunks = meta.get("chunks", [])
-            manifest_hash   = meta.get("manifest_hash", "")
-            model_name      = meta.get("model_name", _EMBED_MODEL)
-            existing_vecs   = np.load(str(vecs_path))
-        except (json.JSONDecodeError, OSError, KeyError):
-            # Corrupt cache — start fresh rather than crashing.
-            pass
+        existing_vecs = cached.embeddings
+        manifest_hash = cached.manifest_hash
+        model_name = cached.model_name
 
     # --- Create the new chunk -----------------------------------------------
-    # chunk_id is the count of chunks already attributed to this source,
-    # giving each source its own zero-based sequence of IDs.
-    next_id   = sum(1 for c in existing_chunks if c["source"] == source)
+    # Continue the source's IDs even if a prior cache contains gaps.
+    next_id = max((c["chunk_id"] for c in existing_chunks if c["source"] == source), default=-1) + 1
     new_chunk = Chunk(source=source, chunk_id=next_id, text=text)
 
     # --- Embed the new chunk ------------------------------------------------
@@ -275,6 +257,7 @@ def add_to_knowledge_base(
     cache_path.mkdir(parents=True, exist_ok=True)
 
     meta_out = {
+        "version": _CACHE_VERSION,
         "manifest_hash": manifest_hash,
         "model_name":    model_name,
         "chunks":        all_chunk_dicts,
@@ -282,18 +265,7 @@ def add_to_knowledge_base(
     meta_path.write_text(json.dumps(meta_out, indent=2, ensure_ascii=False), encoding="utf-8")
     np.save(str(vecs_path), all_vecs)
 
-    # --- Refresh singleton --------------------------------------------------
-    _rag = RagIndex(
-        chunks=[
-            Chunk(source=c["source"], chunk_id=c["chunk_id"], text=c["text"])
-            for c in all_chunk_dicts
-        ],
-        embeddings=all_vecs,
-        model_name=model_name,
-        manifest_hash=manifest_hash,
-    )
-
-    return f"added chunk {new_chunk.citation} (total {len(_rag)} chunks)"
+    return f"added chunk {new_chunk.citation} (total {len(all_chunk_dicts)} chunks)"
 
 
 # ---------------------------------------------------------------------------

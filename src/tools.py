@@ -84,6 +84,8 @@ TOOL_SCHEMAS: list[dict] = [
                     },
                     "max_results": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
                         "description": "Number of results to return (1–8, default 5).",
                         "default": 5,
                     },
@@ -132,8 +134,12 @@ TOOL_SCHEMAS: list[dict] = [
 # then walk only the node types we explicitly allow.  The alternative —
 # eval() — executes arbitrary Python code: a student could pass
 # "__import__('os').system('rm -rf /')" and it would run.  The AST approach
-# is safe by design: any node type not in our whitelist raises ValueError
-# before any computation occurs.
+# rejects constructs outside the allowlist. Resource limits below also bound
+# expression size and arithmetic growth; this is not a general sandbox.
+
+_MAX_EXPRESSION_CHARS = 1024
+_MAX_AST_NODES = 128
+_MAX_INTEGER_BITS = 4096
 
 _ALLOWED_FUNCTIONS: dict[str, Any] = {
     "sqrt": math.sqrt,
@@ -183,11 +189,21 @@ class _SafeCalc(ast.NodeVisitor):
     generic_visit, which raises ValueError and aborts evaluation immediately.
     """
 
+    def visit(self, node: ast.AST) -> Any:
+        result = super().visit(node)
+        if type(result) not in (int, float):
+            raise ValueError("Only real numbers are supported.")
+        if isinstance(result, int) and result.bit_length() > _MAX_INTEGER_BITS:
+            raise ValueError("Result is too large.")
+        if isinstance(result, float) and not math.isfinite(result):
+            raise ValueError("Result must be finite.")
+        return result
+
     def visit_Expression(self, node: ast.Expression) -> Any:
         return self.visit(node.body)
 
     def visit_Constant(self, node: ast.Constant) -> Any:
-        if not isinstance(node.value, (int, float)):
+        if type(node.value) not in (int, float):
             raise ValueError(f"Non-numeric literal: {node.value!r}")
         return node.value
 
@@ -197,6 +213,11 @@ class _SafeCalc(ast.NodeVisitor):
             raise ValueError(f"Operator not allowed: {op_type.__name__}")
         left = self.visit(node.left)
         right = self.visit(node.right)
+        if op_type is ast.Pow:
+            if abs(right) > 10_000:
+                raise ValueError("Exponent is too large.")
+            if isinstance(left, int) and right > 0 and left.bit_length() * right > 8192:
+                raise ValueError("Result is too large.")
         return _ALLOWED_BINOPS[op_type](left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
@@ -234,15 +255,21 @@ class _SafeCalc(ast.NodeVisitor):
 
 def calculate(expression: str) -> str:
     """Parse and evaluate *expression* safely. Returns the result as a string."""
+    if not isinstance(expression, str) or not expression.strip():
+        return "Error: 'expression' must be a non-empty string."
+    if len(expression) > _MAX_EXPRESSION_CHARS:
+        return "Error: expression is too long."
     try:
         tree = ast.parse(expression.strip(), mode="eval")
     except SyntaxError as exc:
         return f"Syntax error in expression: {exc}"
     try:
+        if sum(1 for _ in ast.walk(tree)) > _MAX_AST_NODES:
+            raise ValueError("Expression is too complex.")
         result = _SafeCalc().visit(tree)
     except ZeroDivisionError:
         return "Error: division by zero."
-    except ValueError as exc:
+    except (ValueError, TypeError, ArithmeticError, RecursionError) as exc:
         return f"Error: {exc}"
     # Format: strip trailing .0 for whole-number floats to keep output clean
     if isinstance(result, float) and result.is_integer():
@@ -296,8 +323,20 @@ _TEMP_UNITS = frozenset(_TO_CELSIUS)
 
 def convert(value: float, from_unit: str, to_unit: str) -> str:
     """Convert *value* from *from_unit* to *to_unit*. Returns a result string."""
+    try:
+        valid_value = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid_value = False
+    if not valid_value:
+        return "Error: 'value' must be a finite number."
+    if not isinstance(from_unit, str) or not isinstance(to_unit, str):
+        return "Error: units must be strings."
     f = from_unit.strip()
     t = to_unit.strip()
+
+    for unit in (f, t):
+        if unit not in _TO_BASE and unit not in _TEMP_UNITS:
+            return f"Error: unknown unit '{unit}'."
 
     if f == t:
         return f"{value} {t}"
@@ -308,6 +347,8 @@ def convert(value: float, from_unit: str, to_unit: str) -> str:
             return f"Error: cannot mix temperature unit '{f if f not in _TEMP_UNITS else t}' with a non-temperature unit."
         celsius = _TO_CELSIUS[f](value)
         result = _FROM_CELSIUS[t](celsius)
+        if not math.isfinite(result):
+            return "Error: converted value is too large."
         return f"{value} {f} = {round(result, 6)} {t}"
 
     # Linear path: convert to base unit, then to target
@@ -333,6 +374,8 @@ def convert(value: float, from_unit: str, to_unit: str) -> str:
         return f"Error: cannot convert between {fam_f} ({f}) and {fam_t} ({t})."
 
     result = value * _TO_BASE[f] / _TO_BASE[t]
+    if not math.isfinite(result):
+        return "Error: converted value is too large."
     return f"{value} {f} = {round(result, 8)} {t}"
 
 
@@ -342,17 +385,21 @@ def convert(value: float, from_unit: str, to_unit: str) -> str:
 
 def web_search(query: str, max_results: int = 5) -> str:
     """Search DuckDuckGo and return a formatted numbered list of results."""
+    if not isinstance(query, str) or not query.strip():
+        return "Error: 'query' must be a non-empty string."
+    if type(max_results) is not int:
+        return "Error: 'max_results' must be an integer."
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return "Error: duckduckgo-search package is not installed. Run: pip install duckduckgo-search"
+        return "Error: ddgs package is not installed. Run: pip install -r requirements.txt"
 
     # Cap at 8 to avoid overwhelming the context window with search noise.
     n = max(1, min(max_results, 8))
 
     try:
         with DDGS() as ddgs:
-            hits = list(ddgs.text(query, max_results=n))
+            hits = list(ddgs.text(query.strip(), max_results=n, backend="duckduckgo"))
     except Exception as exc:
         return f"Search failed: {exc}"
 
@@ -387,6 +434,8 @@ def run_tool(name: str, arguments: dict) -> str:
     Returns a string result in all cases — errors are returned as strings
     so the model can read them and adjust its response rather than crashing.
     """
+    if not isinstance(arguments, dict):
+        return "Error: tool arguments must be a JSON object."
     if name == "get_current_datetime":
         return get_current_datetime()
 
@@ -400,14 +449,14 @@ def run_tool(name: str, arguments: dict) -> str:
         query = arguments.get("query", "")
         if not query:
             return "Error: 'query' argument is required."
-        max_results = int(arguments.get("max_results", 5))
+        max_results = arguments.get("max_results", 5)
         return web_search(query, max_results)
 
     if name == "unit_converter":
         try:
-            value     = float(arguments["value"])
-            from_unit = str(arguments["from_unit"])
-            to_unit   = str(arguments["to_unit"])
+            value     = arguments["value"]
+            from_unit = arguments["from_unit"]
+            to_unit   = arguments["to_unit"]
         except (KeyError, TypeError, ValueError) as exc:
             return f"Error: invalid arguments for unit_converter: {exc}"
         return convert(value, from_unit, to_unit)

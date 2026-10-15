@@ -4,7 +4,7 @@ StudyMate MCP server — exposes StudyMate tools over stdio.
 Run directly:
   python mcp_server.py
 
-Or register in Claude Desktop's config (see README.md for the full JSON block).
+Or register in an MCP client's configuration (see README.md).
 The server uses stdio transport so Claude Desktop can spawn and communicate
 with it as a subprocess.
 """
@@ -57,6 +57,10 @@ async def list_tools() -> list[Tool]:
                             "When provided, StudyMate can retrieve relevant "
                             "passages and cite them in its answer."
                         ),
+                    },
+                    "cache_dir": {
+                        "type": "string",
+                        "description": "Notes index directory (default: rag_index).",
                     },
                 },
                 "required": ["question"],
@@ -130,7 +134,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "ask_studymate":
             question = arguments.get("question", "")
             docs     = arguments.get("docs")
-            result   = await asyncio.to_thread(ask_studymate, question, docs)
+            cache_dir = arguments.get("cache_dir", "rag_index")
+            result = await asyncio.to_thread(ask_studymate, question, docs, cache_dir)
 
         elif name == "add_to_knowledge_base":
             text      = arguments.get("text", "")

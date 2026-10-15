@@ -193,7 +193,7 @@ def run_turn(
         for tc in response.tool_calls:
             try:
                 args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 args = {}
 
             result = dispatch_tool(tc.function.name, args, rag)
@@ -220,7 +220,7 @@ def run_turn(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="studymate",
-        description="AI study assistant powered by Claude.",
+        description="Personal study-agent experiment with tools, memory, and notes retrieval.",
     )
     parser.add_argument(
         "--docs",
