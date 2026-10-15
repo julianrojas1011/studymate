@@ -18,3 +18,10 @@ rag_index/
 # Build artifacts
 dist/
 *.egg-info/
+
+# Local development-tool settings
+.claude/
+
+# Personal conversation history
+memory.json
+memory.tmp
